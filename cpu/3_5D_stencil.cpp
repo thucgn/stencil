@@ -17,7 +17,7 @@ typedef double FT;
 typedef double* PFT;
 typedef size_t IT;
 
-#define PRINT_DEBUG
+//#define PRINT_DEBUG
 #define THREADS 12
 #define DIMT 3
 #define DIMX 564
@@ -126,6 +126,17 @@ void compute_subplane(grid_data* pgd, grid_data* subgrid, int dimx, int dimy, in
 				}
 
 			}
+#ifdef PRINT_DEBUG
+			printf("iter1 z== : %d\n", z);
+			for(y = 1 - DIMT; y < wc + DIMT-1; ++y)
+			{
+				for(x = 1 - DIMT; x < dimx + DIMT-1; ++x)
+				{
+					printf("%.1f ", ES(t1buf, x, y, z%dimt, t1dimx, t1dimy));
+				}
+				printf("\n");
+			}
+#endif
 			//iter 2
 			if(z >= 1 && dimt >= 2)
 			{
@@ -161,13 +172,24 @@ void compute_subplane(grid_data* pgd, grid_data* subgrid, int dimx, int dimy, in
 								+ ES(t1buf, x+1, y, zm1, t1dimx, t1dimy)
 								+ ES(t1buf, x, y-1, zm1, t1dimx, t1dimy)
 								+ ES(t1buf, x, y+1, zm1, t1dimx, t1dimy)
-								+ ES(t1buf, x, y, (zm1-1)%dimt, t1dimx, t1dimy)
+								+ ES(t1buf, x, y, (zm1-1 + dimt)%dimt, t1dimx, t1dimy)
 								+ ES(t1buf, x, y, (zm1+1)%dimt, t1dimx, t1dimy) );
 						}
 					}
 
 				}
 			}
+#ifdef PRINT_DEBUG
+			printf("iter2 z== : %d\n", z);
+			for(y = 2 - DIMT; y < wc + DIMT-2; ++y)
+			{
+				for(x = 2 - DIMT; x < dimx + DIMT-2; ++x)
+				{
+					printf("%.1f ", ES(t2buf, x, y, (z-1 + dimt)%dimt, t2dimx, t2dimy));
+				}
+				printf("\n");
+			}
+#endif
 			//iter 3
 			if(z >= 2 && dimt == 3)
 			{
@@ -194,11 +216,11 @@ void compute_subplane(grid_data* pgd, grid_data* subgrid, int dimx, int dimy, in
 					{
 						for(x = 0; x < dimx; ++ x)
 						{
-							E(outsubgrid, x, y, zm2) = CENTER_WIGHT*ES(t2buf, x, y, zm2, t2dimx, t2dimy) + ADJACENT_WIGHT * ( ES(t2buf, x-1, y, zm2, t2dimx, t2dimy)
+							E(outsubgrid, x, y, z-2) = CENTER_WIGHT*ES(t2buf, x, y, zm2, t2dimx, t2dimy) + ADJACENT_WIGHT * ( ES(t2buf, x-1, y, zm2, t2dimx, t2dimy)
 								+ ES(t2buf, x+1, y, zm2, t2dimx, t2dimy)
 								+ ES(t2buf, x, y-1, zm2, t2dimx, t2dimy)
 								+ ES(t2buf, x, y+1, zm2, t2dimx, t2dimy)
-								+ ES(t2buf, x, y, (zm2-1)%dimt, t2dimx, t2dimy) 
+								+ ES(t2buf, x, y, (zm2-1+dimt)%dimt, t2dimx, t2dimy) 
 								+ ES(t2buf, x, y, (zm2+1)%dimt, t2dimx, t2dimy));
 							
 						}
@@ -206,10 +228,70 @@ void compute_subplane(grid_data* pgd, grid_data* subgrid, int dimx, int dimy, in
 
 				}
 			}
+#ifdef PRINT_DEBUG
+			printf("iter3 z== : %d\n", z);
+			for(y = 0; y < wc; ++y)
+			{
+				for(x = 0; x < dimx; ++x)
+				{
+					printf("%.1f ", E(outsubgrid, x, y, (z-2+dimt)%dimt));
+				}
+				printf("\n");
+			}
+#endif
 
 			
 
 		}
+		//z = Nz - 2
+		if(dimt == 3)
+		{
+			int zm = (Nz - 1) % dimt;
+			for(y = 2 - DIMT; y < wc + DIMT-2; ++ y)
+			{
+				for(x = 2 - DIMT; x < dimx + DIMT-2; ++ x)
+				{
+					if((XLB && x < 0) || (XRB && x >= dimx) || (YLB && y < 0) || (YRB && y >= dimy))
+						ES(t2buf, x, y, zm, t2dimx, t2dimy) = 0.0;
+					else
+						ES(t2buf, x, y, zm, t2dimx, t2dimy) = CENTER_WIGHT*ES(t1buf, x, y, zm, t1dimx, t1dimy) + ADJACENT_WIGHT * ( 
+						ES(t1buf, x-1, y, zm, t1dimx, t1dimy)
+						+ ES(t1buf, x+1, y, zm, t1dimx, t1dimy)
+						+ ES(t1buf, x, y-1, zm, t1dimx, t1dimy)
+						+ ES(t1buf, x, y+1, zm, t1dimx, t1dimy)
+						+ ES(t1buf, x, y, (zm-1 + dimt)%dimt, t1dimx, t1dimy)
+						+ ES(t1buf, x, y, (zm+1)%dimt, t1dimx, t1dimy) );
+				}
+			}
+			zm = (Nz - 2) % dimt;
+			for(y = 0; y < wc; ++ y)
+			{
+				for(x = 0; x < dimx; ++ x)
+				{
+					E(outsubgrid, x, y, Nz-2) = CENTER_WIGHT*ES(t2buf, x, y, zm, t2dimx, t2dimy) + ADJACENT_WIGHT * ( ES(t2buf, x-1, y, zm, t2dimx, t2dimy)
+						+ ES(t2buf, x+1, y, zm, t2dimx, t2dimy)
+						+ ES(t2buf, x, y-1, zm, t2dimx, t2dimy)
+						+ ES(t2buf, x, y+1, zm, t2dimx, t2dimy)
+						+ ES(t2buf, x, y, (zm-1+dimt)%dimt, t2dimx, t2dimy) 
+						+ ES(t2buf, x, y, (zm+1)%dimt, t2dimx, t2dimy));
+					
+				}
+			}
+			zm = (Nz - 1) % dimt;
+			for(y = 0; y < wc; ++ y)
+			{
+				for(x = 0; x < dimx; ++ x)
+				{
+					E(outsubgrid, x, y, Nz-1) = CENTER_WIGHT*ES(t2buf, x, y, zm, t2dimx, t2dimy) + ADJACENT_WIGHT * ( ES(t2buf, x-1, y, zm, t2dimx, t2dimy)
+						+ ES(t2buf, x+1, y, zm, t2dimx, t2dimy)
+						+ ES(t2buf, x, y-1, zm, t2dimx, t2dimy)
+						+ ES(t2buf, x, y+1, zm, t2dimx, t2dimy)
+						+ ES(t2buf, x, y, (zm-1+dimt)%dimt, t2dimx, t2dimy));
+					
+				}
+			}
+		}
+		
 	}
 
 }

@@ -17,7 +17,7 @@ typedef double FT;
 typedef double* PFT;
 typedef size_t IT;
 
-//#define PRINT_DEBUG
+#define PRINT_DEBUG
 #define THREADS 12
 #define DIMT 3
 #define DIMX 564
@@ -259,8 +259,7 @@ void compute_subplane(grid_data* pgd, grid_data* subgrid, int dimx, int dimy, in
 						+ ES(t1buf, x+1, y, zm, t1dimx, t1dimy)
 						+ ES(t1buf, x, y-1, zm, t1dimx, t1dimy)
 						+ ES(t1buf, x, y+1, zm, t1dimx, t1dimy)
-						+ ES(t1buf, x, y, (zm-1 + dimt)%dimt, t1dimx, t1dimy)
-						+ ES(t1buf, x, y, (zm+1)%dimt, t1dimx, t1dimy) );
+						+ ES(t1buf, x, y, (zm-1 + dimt)%dimt, t1dimx, t1dimy));
 				}
 			}
 			zm = (Nz - 2) % dimt;

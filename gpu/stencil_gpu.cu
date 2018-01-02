@@ -16,12 +16,11 @@ typedef double FT;
 typedef double* PFT;
 
 //#define PRINT_DEBUG
-#define CENTER_WIGHT 2.0
-#define ADJACENT_WIGHT 1.1
-#define E(data, x, y, z, xstride, ystride) data[((z)*(ystride)+(y))*(xstride)+x]
-#define PE(data, x, y, xstride) data[(y)*(xstride) + (x)]
-#define PLANE(data, z, xstride, ystride) data[(z)*(xstride)*(ystride)]
-#define BLOCK_WIDTH 32
+#define CENTER_WEIGTH 1.0
+#define ADJACENT_WEIGTH 0.1
+#define BW 16
+#define BH 16
+#define E(data, x, y, z, xstride, ystride) data[((z)*(ystride)+y)*(xstride)+x]
 
 inline void checkCudaErrors(cudaError err)
 {
@@ -31,154 +30,92 @@ inline void checkCudaErrors(cudaError err)
 	}
 }
 
-__global__ void stencil_7_point(int Nx, int Ny, int Nz, PFT data, PFT out_data)
+__global__ void stencil_7_point(int Nx, int Ny, int Nz, PFT in_data, PFT out_data)
 {
-
-	const int X_EDGE_BLOCKS = Nx/BLOCK_WIDTH;
-	const int Y_EDGE_BLOCKS = Ny/BLOCK_WIDTH;
-	const int X_STRIDE = Nx+2;
-	const int Y_STRIDE = Ny+2;
 	register const int ty = threadIdx.y, tx = threadIdx.x;
-	register const int rty = ty+1, rtx = tx+1;
-	register const int by = blockIdx.y, bx = blockIdx.x;
-	register const int gy = by*BLOCK_WIDTH + ty, gx = bx*BLOCK_WIDTH + tx;
-	register int i, im, ic, ia;
-	register PFT plane;
-	register const PFT out_origin = &(E(out_data, 1, 1, 0, X_STRIDE, Y_STRIDE));
+	register const int rtx = tx+1, rty = ty+1;
+	register const int by = blockIdx.y, bx = blockIdx.x, bz = blockIdx.z;
+	register const int x = bx*BW+tx, y = by*BW+ty, z = bz*BH;
+	register int i, zn, zc, za;
 
-	__shared__ FT buf[3][BLOCK_WIDTH+2][BLOCK_WIDTH+2];
+	__shared__ FT buf[3][BW+2][BW+2];
 
-	
-	if((by<Y_EDGE_BLOCKS-1 && bx<X_EDGE_BLOCKS-1) || (Nx % BLOCK_WIDTH == 0 && Ny % BLOCK_WIDTH == 0))
+	if(x < Nx && y < Ny)
 	{
-		//first layer
-		plane = &(E(data, 1, 1, 0, X_STRIDE, Y_STRIDE));
-		buf[0][rty][rtx] = PE(plane, gx, gy, X_STRIDE);
-		if(ty == 0)
-			buf[0][0][rtx] = PE(plane, gx, gy-1, X_STRIDE);
-		else if(ty == BLOCK_WIDTH-1)
-			buf[0][BLOCK_WIDTH+1][rtx] = PE(plane, gx, gy+1, X_STRIDE);
-
+		//load ghost layer
+		buf[0][rty][rtx] = (z != 0) ? E(in_data, x, y, z-1, Nx, Ny) : 0.0;
+		//load first layer
+		buf[1][rty][rtx] = E(in_data, x, y, z, Nx, Ny);
+		//load xyboundry
 		if(tx == 0)
-			buf[0][rty][0] = PE(plane, gx-1, gy, X_STRIDE);
-		else if(tx == BLOCK_WIDTH-1)
-			buf[0][rty][BLOCK_WIDTH+1] = PE(plane, gx+1, gy, X_STRIDE);
-
-		//second layer
-		plane = &(E(data, 1, 1, 1, X_STRIDE, Y_STRIDE));
-		buf[1][rty][rtx] = PE(plane, gx, gy, X_STRIDE);
-		if(ty == 0)
-			buf[1][0][rtx] = PE(plane, gx, gy-1, X_STRIDE);
-		else if(ty == BLOCK_WIDTH-1)
-			buf[1][BLOCK_WIDTH+1][rtx] = PE(plane, gx, gy+1, X_STRIDE);
-
-		if(tx == 0)
-			buf[1][rty][0] = PE(plane, gx-1, gy, X_STRIDE);
-		else if(tx == BLOCK_WIDTH-1)
-			buf[1][rty][BLOCK_WIDTH+1] = PE(plane, gx+1, gy, X_STRIDE);
-
-
-		for(i = 2; i < Nz+2; ++i)
-		{
-			ia = i % 3;
-			//ith layer
-			plane = &(E(data, 1, 1, i, X_STRIDE, Y_STRIDE));
-			buf[ia][rty][rtx] = PE(plane, gx, gy, X_STRIDE);
-			if(ty == 0)
-				buf[ia][0][rtx] = PE(plane, gx, gy-1, X_STRIDE);
-			else if(ty == BLOCK_WIDTH-1)
-				buf[ia][BLOCK_WIDTH+1][rtx] = PE(plane, gx, gy+1, X_STRIDE);
-
-			if(tx == 0)
-				buf[ia][rty][0] = PE(plane, gx-1, gy, X_STRIDE);
-			else if(tx == BLOCK_WIDTH-1)
-				buf[ia][rty][BLOCK_WIDTH+1] = PE(plane, gx+1, gy, X_STRIDE);
-
-			__syncthreads();
-
-			//calculate i-1 layer
-			ic = (i-1) % 3;
-			im = (i-2) % 3;
-			E(out_origin, gx, gy, i-1, X_STRIDE, Y_STRIDE) = CENTER_WIGHT * buf[ic][rty][rtx]
-				+ ADJACENT_WIGHT*( buf[ic][rty][tx] + buf[ic][rty][rtx+1] 
-				+ buf[ic][ty][rtx] + buf[ic][rty+1][rtx]
-				+ buf[im][rty][rtx] + buf[ia][rty][rtx]
-				);
-		}
-
-	}
-	else
-	{
-		//first layer
-		if(gx > Nx-1 || gy > Ny-1)
-			return;
-		plane = &(E(data, 1, 1, 0, X_STRIDE, Y_STRIDE));
-		buf[0][rty][rtx] = PE(plane, gx, gy, X_STRIDE);
-		if(ty == 0)
-			buf[0][0][rtx] = PE(plane, gx, gy-1, X_STRIDE);
-		else if(gy == Ny-1)
-			buf[0][rty+1][rtx] = 0.0;
-
-		if(tx == 0)
-			buf[0][rty][0] = PE(plane, gx-1, gy, X_STRIDE);
-		else if(gx == Nx-1)
-			buf[0][rty][rtx+1] = 0.0;
-
-		//second layer
-		plane = &(E(data, 1, 1, 1, X_STRIDE, Y_STRIDE));
-		buf[1][rty][rtx] = PE(plane, gx, gy, X_STRIDE);
-		if(ty == 0)
-			buf[1][0][rtx] = PE(plane, gx, gy-1, X_STRIDE);
-		else if(gy == Ny-1)
-			buf[1][rty+1][rtx] = 0.0;
-
-		if(tx == 0)
-			buf[1][rty][0] = PE(plane, gx-1, gy, X_STRIDE);
-		else if(gx == Nx-1)
+			buf[1][rty][0] = (x != 0) ? E(in_data, x-1, y, z, Nx, Ny) : 0.0;
+		else if(tx == BW-1)
+			buf[1][rty][BW+1] = (x != Nx-1) ? E(in_data, x+1, y, z, Nx, Ny) : 0.0;
+		else if(x == Nx-1)
 			buf[1][rty][rtx+1] = 0.0;
 
+		if(ty == 0)
+			buf[1][0][rtx] = (y != 0) ? E(in_data, x, y-1, z, Nx, Ny) : 0.0;
+		else if(ty == BW-1)
+			buf[1][BW+1][rtx] = (y != Ny-1) ? E(in_data, x, y+1, z, Nx, Ny) : 0.0;
+		else if(ty == Ny-1)
+			buf[1][rty+1][rtx] = 0.0;
 
-		for(i = 2; i < Nz+2; ++i)
+		__syncthreads();
+
+		for(i = 1; i <= BH && (z+i) <= Nz; ++i)
 		{
-			ia = i % 3;
-			//ith layer
-			plane = &(E(data, 1, 1, i, X_STRIDE, Y_STRIDE));
-			buf[ia][rty][rtx] = PE(plane, gx, gy, X_STRIDE);
-			if(ty == 0)
-				buf[ia][0][rtx] = PE(plane, gx, gy-1, X_STRIDE);
-			else if(gy == Ny-1)
-				buf[ia][rty+1][rtx] = 0.0;
+			zc = i % 3;
+			za = (i+1) % 3;
+			zn = z + i;
+			if(zn < Nz)
+			{
+				buf[za][rty][rtx] = E(in_data, x, y, zn, Nx, Ny);
+				if(tx == 0)
+					buf[za][rty][0] = (x != 0) ? E(in_data, x-1, y, zn, Nx, Ny) : 0.0;
+				else if(tx == BW-1)
+					buf[za][rty][BW+1] = (x != Nx-1) ? E(in_data, x+1, y, zn, Nx, Ny) : 0.0;
+				else if(x == Nx-1)
+					buf[za][rty][rtx+1] = 0.0;
 
-			if(tx == 0)
-				buf[ia][rty][0] = PE(plane, gx-1, gy, X_STRIDE);
-			else if(gx == Nx-1)
-				buf[ia][rty][rtx+1] = 0.0;
+				if(ty == 0)
+					buf[za][0][rtx] = (y != 0) ? E(in_data, x, y-1, zn, Nx, Ny) : 0.0;
+				else if(ty == BW-1)
+					buf[za][BW+1][rtx] = (y != Ny-1) ? E(in_data, x, y+1, zn, Nx, Ny) : 0.0;
+				else if(y == Ny-1)
+					buf[za][rty+1][rtx] = 0.0;
+			}
+			else
+			{
+				int j, k;
+				for(j = 0; j < (BW+2); ++j)
+					for(k = 0; k < (BW+2); ++k)
+						buf[za][j][k] = 0.0;
+
+			}
 
 			__syncthreads();
+			E(out_data, x, y, zn-1, Nx, Ny) = CENTER_WEIGTH * buf[zc][rty][rtx]
+				+ ADJACENT_WEIGTH * ( buf[zc][rty][rtx+1] + buf[zc][rty][rtx-1]
+				+ buf[zc][rty-1][rtx] + buf[zc][rty+1][rtx]
+				+ buf[za][rty][rtx] + buf[(i-1)%3][rty][rtx]);
+			__syncthreads();
 
-			//calculate i-1 layer
-			ic = (i-1) % 3;
-			im = (i-2) % 3;
-			E(out_origin, gx, gy, i-1, X_STRIDE, Y_STRIDE) = CENTER_WIGHT * buf[ic][rty][rtx]
-				+ ADJACENT_WIGHT*( buf[ic][rty][tx] + buf[ic][rty][rtx+1] 
-				+ buf[ic][ty][rtx] + buf[ic][rty+1][rtx]
-				+ buf[im][rty][rtx] + buf[ia][rty][rtx]
-				);
 		}
-
 	}
+
 }
 
 void init_data(PFT data, size_t Nx, size_t Ny, size_t Nz)
 {
-	memset(data, 0, (Nx+2)*(Ny+2)*(Nz+2)*sizeof(FT));
+	memset(data, 0, (Nx)*(Ny)*(Nz)*sizeof(FT));
 	srand((unsigned int)time(NULL));
-	for(size_t z = 1; z < Nz+1; ++z)
+	for(size_t z = 0; z < Nz; ++z)
 	{
-		for(size_t y = 1; y < Ny+1; ++y)
-			for(size_t x = 1; x < Nx+1; ++x)
+		for(size_t y = 0; y < Ny; ++y)
+			for(size_t x = 0; x < Nx; ++x)
 			{
-				data[(z*(Ny+2)+y) * (Nx+2) + x] = 1.0;
+				data[(z*(Nx)+y) * (Nx) + x] = 1.0;
 			}
 	}
 }
@@ -200,10 +137,19 @@ void print_data(PFT data, size_t Nx, size_t Ny, size_t Nz)
 	}
 }
 
+double checkSum(PFT data, size_t Nx, size_t Ny, size_t Nz, size_t z)
+{
+	double res = 0.0;
+	for(size_t y = 0; y < Ny; ++y)
+		for(size_t x = 0; x < Nx; ++x)
+			res += E(data, x, y, z, Nx, Ny);
+	return res;
+}
+
 void stencil_gpu(size_t Nx, size_t Ny, size_t Nz, size_t NIter)
 {
 	printf("begin stencil!\n");	
-	size_t memsize = (Nx+2) * (Ny+2) * (Nz+2) * sizeof(FT);
+	size_t memsize = Nx * Ny * Nz * sizeof(FT);
 	int i;
 
 	PFT h_data = (PFT)malloc(memsize);
@@ -211,7 +157,7 @@ void stencil_gpu(size_t Nx, size_t Ny, size_t Nz, size_t NIter)
 	init_data(h_data, Nx, Ny, Nz);
 
 #ifdef PRINT_DEBUG
-	//print_data(h_data, Nx+2, Ny+2, Nz+2);
+	print_data(h_data, Nx, Ny, Nz);
 #endif
 
 	printf("finish data initialization!\n");
@@ -226,8 +172,8 @@ void stencil_gpu(size_t Nx, size_t Ny, size_t Nz, size_t NIter)
 	checkCudaErrors(cudaMemcpy(d1_data, h_data, memsize, cudaMemcpyHostToDevice));
 	printf("finish cuda memcpy!\n");
 
-	dim3 threads(BLOCK_WIDTH, BLOCK_WIDTH);
-	dim3 grid((Nx+BLOCK_WIDTH-1)/BLOCK_WIDTH, (Ny+BLOCK_WIDTH-1)/BLOCK_WIDTH);
+	dim3 threads(BW, BW);
+	dim3 grid((Nx+BW-1)/BW, (Ny+BW-1)/BW, (Nz+BH-1)/BH);
 
 	cudaEvent_t start, stop;
 	checkCudaErrors(cudaEventCreate(&start)); 
@@ -238,10 +184,12 @@ void stencil_gpu(size_t Nx, size_t Ny, size_t Nz, size_t NIter)
 	{
 		if(i % 2 == 0)
 		{
+			//printf("begin calculate\n");
 			stencil_7_point<<<grid, threads>>>(Nx, Ny, Nz, d1_data, d2_data);
 		}
 		else
 		{
+			//printf("begin calculate\n");
 			stencil_7_point<<<grid, threads>>>(Nx, Ny, Nz, d2_data, d1_data);
 		}
 	}
@@ -256,8 +204,12 @@ void stencil_gpu(size_t Nx, size_t Ny, size_t Nz, size_t NIter)
 	else
 		checkCudaErrors(cudaMemcpy(h_data, d1_data, memsize, cudaMemcpyDeviceToHost));
 #ifdef PRINT_DEBUG
-	print_data(h_data, Nx+2, Ny+2, Nz+2);
+	print_data(h_data, Nx, Ny, Nz);
 #endif
+	for(int i = 0;i < 10 && i < Nz; ++i)
+	{
+		printf("checksum layer %d and %d : %.5f , %.5f\n ", i, Nz-1-i, checkSum(h_data, Nx, Ny, Nz, i), checkSum(h_data, Nx, Ny, Nz, Nz-1-i));
+	}
 	printf("==============time : %.5f ms\n", msecTotal);
 
 	checkCudaErrors(cudaFree(d1_data));

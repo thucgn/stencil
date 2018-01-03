@@ -10,6 +10,8 @@
 #include <time.h>
 #include <string.h>
 #include <omp.h>
+#include "immintrin.h"
+#include "mkl.h"
 
 using namespace std;
 
@@ -17,14 +19,16 @@ typedef double FT;
 typedef double* PFT;
 typedef size_t IT;
 
-#define PRINT_DEBUG
+//#define PRINT_DEBUG
+#define PRINT_FINISH_DEBUG
 #define THREADS 12
 #define DIMT 3
-#define DIMX 564
-#define DIMY 564
-#define ROWS 47
-#define CENTER_WIGHT 2.0
-#define ADJACENT_WIGHT 1.1
+#define DIMX 480
+#define DIMY 480
+#define BOUNDARY_OFFSET 2
+#define ROWS 40
+#define CENTER_WIGHT 1.0
+#define ADJACENT_WIGHT 0.1
 #define E(pgd, x, y, z) ((pgd->data)[((z)*pgd->ystride + (y)) * pgd->xstride + (x)])
 #define ES(data, x, y, z, xs, ys) (data[((z)*(ys)+(y)) * (xs) + (x)])
 
@@ -36,6 +40,7 @@ static FT buffer2[(DIMX+2*DIMT-4)*(DIMY+2*DIMT-4)*3*8] = {
 	0
 };
 
+FT *bufferB1_1, *bufferB1_2, *bufferB2_1, *bufferB2_2, *bufferB3_1, *bufferB3_2, *bufferB4_1, *bufferB4_2;
 
 typedef struct grid_data
 {
@@ -60,8 +65,8 @@ void init_griddata(grid_data* pgd)
 
 	for(z = 1; z < pgd->Nz+1; ++z)
 	{
-		for(y = DIMT; y < pgd->Ny+DIMT; ++y)
-			for(x = DIMT; x < pgd->Nx+DIMT; ++x)
+		for(y = 1; y < pgd->Ny+1; ++y)
+			for(x = 1; x < pgd->Nx+1; ++x)
 			{
 				//E(pgd, x, y, z) = (double)(rand() * 2) / RAND_MAX;
 				E(pgd, x, y, z) = 1.0;
@@ -71,10 +76,12 @@ void init_griddata(grid_data* pgd)
 }
 
 
-void compute_subplane(grid_data* pgd, grid_data* subgrid, int dimx, int dimy, int dimt, grid_data* outsubgrid, bool XLB, bool XRB, bool YLB, bool YRB)
+void compute_subplane(grid_data* pgd, grid_data* subgrid, int dimx, int dimy, int dimt, grid_data* outsubgrid)
 {
 	int Nz = pgd->Nz;
-	int wr, rr, x,y,z,iter, wi, wc;
+	int wr, rr, wi;
+	memset(buffer, 0, (DIMX+2*DIMT-2)*(DIMY+2*DIMT-2)*3*8);
+	memset(buffer2, 0, (DIMX+2*DIMT-4)*(DIMY+2*DIMT-4)*3*8);
 	int t1dimx = dimx + 2*DIMT - 2, t1dimy = dimy + 2*DIMT - 2;
 	int t2dimx = dimx + 2*DIMT - 4, t2dimy = dimy + 2*DIMT - 4;
 	PFT t1buf = &(ES(buffer, DIMT-1,DIMT-1, 0, t1dimx, t1dimy));
@@ -82,46 +89,109 @@ void compute_subplane(grid_data* pgd, grid_data* subgrid, int dimx, int dimy, in
 
 	wr = (dimy + ROWS - 1)/ROWS, rr = dimy % ROWS;
 
-	//#pragma omp parallel for private(x, y, z, iter, wc) num_threads(THREADS)
+	#pragma omp parallel for schedule(dynamic) num_threads(12)
 	for(wi = 0; wi < wr; ++ wi)
 	{
-		wc = (wi != wr - 1 || !rr) ? ROWS : rr;
+		FT *x_stream, *y_m1_stream, *y_a1_stream, *z_m1_stream, *z_a1_stream, *out_center;
+		int wc = (wi != wr - 1 || !rr) ? ROWS : rr;
+		int x, y, z;
 		int offset = wi*ROWS;
+		//printf("id: %d, wi: %d, wr: %d, rr:%d, wc:%d, offset:%d\n",omp_get_thread_num(), wi, wr, rr, wc, offset);
 		int zm0, zm1, zm2;
+		register __m256d vc, vxm1, vxa1, vym1, vya1, vzm1, vza1;
+		register __m256d cw = _mm256_set1_pd(CENTER_WIGHT);
+		register __m256d aw = _mm256_set1_pd(ADJACENT_WIGHT);
 		for(z = 0; z < Nz; ++z)
 		{
 			//iter 1
 			if(dimt == 1)
 			{
-				for(y = 1 - dimt; y < wc+dimt-1; ++ y)
+				for(y = offset; y < wc+offset; ++ y)
 				{
-					for(x = 1 - dimt; x < dimx+dimt-1; ++x)
+					out_center = &(E(outsubgrid, 0, y, z));
+					x_stream = &(E(subgrid, 0, y, z));
+					y_m1_stream = &(E(subgrid, 0, y-1, z));
+					y_a1_stream = &(E(subgrid, 0, y+1, z));
+					z_m1_stream = &(E(subgrid, 0, y, z-1));
+					z_a1_stream = &(E(subgrid, 0, y, z+1));
+					/*for(x = 0; x < dimx; ++x)
 					{
-						E(outsubgrid, x, y, z) = CENTER_WIGHT*E(subgrid, x,y+offset,z) + ADJACENT_WIGHT * ( E(subgrid,x-1,y+offset,z)
-								+ E(subgrid, x+1,y+offset,z)
-								+ E(subgrid, x, y-1+offset, z)
-								+ E(subgrid, x, y+1+offset, z)
-								+ E(subgrid, x, y+offset, z-1)
-								+ E(subgrid, x, y+offset, z+1) );
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+								+ *(y_m1_stream+x) + *(y_a1_stream+x)
+								+ *(z_m1_stream+x) + *(z_a1_stream+x));
+
+					}*/
+					for(x = 0; x+3 < dimx; x += 4)
+					{
+						vc   = _mm256_load_pd(x_stream+x);				
+						vxm1 = _mm256_load_pd(x_stream+x-1);
+						vc   = _mm256_mul_pd(vc, cw);
+						vxa1 = _mm256_load_pd(x_stream+x+1);
+						vc   = _mm256_fmadd_pd(vxm1, aw, vc);
+						vym1 = _mm256_load_pd(y_m1_stream+x);
+						vc   = _mm256_fmadd_pd(vxa1, aw, vc);
+						vya1 = _mm256_load_pd(y_a1_stream+x);
+						vc   = _mm256_fmadd_pd(vym1, aw, vc);
+						vzm1 = _mm256_load_pd(z_m1_stream+x);
+						vc   = _mm256_fmadd_pd(vya1, aw, vc);
+						vza1 = _mm256_load_pd(z_a1_stream+x);
+						vc   = _mm256_fmadd_pd(vzm1, aw, vc);
+						vc   = _mm256_fmadd_pd(vza1, aw, vc);
+						_mm256_store_pd(out_center+x, vc);
 					}
+					//x -= 4;
+					for(; x < dimx; ++x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+								+ *(y_m1_stream+x) + *(y_a1_stream+x)
+								+ *(z_m1_stream+x) + *(z_a1_stream+x));
+
+					}
+
 				}
 
 			}
 			else
 			{
-				for(y = 1 - DIMT; y < wc+DIMT-1; ++ y)
+				for(y = 1 - DIMT +offset; y < wc+DIMT-1+offset; ++ y)
 				{
-					for(x = 1 - DIMT; x < dimx+DIMT-1; ++x)
+					out_center = &(ES(t1buf, 0, y, z%dimt, t1dimx, t1dimy));
+					x_stream = &(E(subgrid, 0, y, z));
+					y_m1_stream = &(E(subgrid, 0, y-1, z));
+					y_a1_stream = &(E(subgrid, 0, y+1, z));
+					z_m1_stream = &(E(subgrid, 0, y, z-1));
+					z_a1_stream = &(E(subgrid, 0, y, z+1));
+					/*for(x = 1 - DIMT; x < dimx+DIMT-1; ++x)
 					{
-						if((XLB && x < 0) || (XRB && x >= dimx) || (YLB && y < 0) || (YRB && y >= dimy))
-							ES(t1buf, x, y, z%dimt, t1dimx, t1dimy) = 0.0;
-						else
-							ES(t1buf, x, y, z%dimt, t1dimx, t1dimy) = CENTER_WIGHT*E(subgrid, x,y+offset,z) + ADJACENT_WIGHT * ( E(subgrid,x-1,y+offset,z)
-								+ E(subgrid, x+1,y+offset,z)
-								+ E(subgrid, x, y-1+offset, z)
-								+ E(subgrid, x, y+1+offset, z)
-								+ E(subgrid, x, y+offset, z-1)
-								+ E(subgrid, x, y+offset, z+1) );
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+								+ *(y_m1_stream+x) + *(y_a1_stream+x)
+								+ *(z_m1_stream+x) + *(z_a1_stream+x));
+					}*/
+					for(x = 1 - DIMT; x+3 < dimx+DIMT-1; x += 4)
+					{
+						vc   = _mm256_load_pd(x_stream+x);				
+						vxm1 = _mm256_load_pd(x_stream+x-1);
+						vc   = _mm256_mul_pd(vc, cw);
+						vxa1 = _mm256_load_pd(x_stream+x+1);
+						vc   = _mm256_fmadd_pd(vxm1, aw, vc);
+						vym1 = _mm256_load_pd(y_m1_stream+x);
+						vc   = _mm256_fmadd_pd(vxa1, aw, vc);
+						vya1 = _mm256_load_pd(y_a1_stream+x);
+						vc   = _mm256_fmadd_pd(vym1, aw, vc);
+						vzm1 = _mm256_load_pd(z_m1_stream+x);
+						vc   = _mm256_fmadd_pd(vya1, aw, vc);
+						vza1 = _mm256_load_pd(z_a1_stream+x);
+						vc   = _mm256_fmadd_pd(vzm1, aw, vc);
+						vc   = _mm256_fmadd_pd(vza1, aw, vc);
+						_mm256_store_pd(out_center+x, vc);
+					}
+					//x -= 4;
+					for(; x < dimx+DIMT-1; ++x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+								+ *(y_m1_stream+x) + *(y_a1_stream+x)
+								+ *(z_m1_stream+x) + *(z_a1_stream+x));
+
 					}
 				}
 
@@ -141,43 +211,48 @@ void compute_subplane(grid_data* pgd, grid_data* subgrid, int dimx, int dimy, in
 			if(z >= 1 && dimt >= 2)
 			{
 				zm1 = (z-1) % dimt;
-				if(z == 1)
+				for(y = 2 - DIMT + offset; y < wc + DIMT-2 + offset; ++ y)
 				{
-					for(y = 2 - DIMT; y < wc + DIMT-2; ++ y)
+					out_center = &(ES(t2buf, 0, y, zm1, t2dimx, t2dimy));
+					x_stream = &(ES(t1buf, 0, y, zm1, t1dimx, t1dimy));
+					y_m1_stream = &(ES(t1buf, 0, y-1, zm1, t1dimx, t1dimy));
+					y_a1_stream = &(ES(t1buf, 0, y+1, zm1, t1dimx, t1dimy));
+					z_m1_stream = &(ES(t1buf, 0, y, (zm1-1+dimt)%dimt, t1dimx, t1dimy));
+					z_a1_stream = &(ES(t1buf, 0, y, (zm1+1)%dimt, t1dimx, t1dimy));
+					/*for(x = 2 - DIMT; x < dimx + DIMT-2; ++ x)
 					{
-						for(x = 2 - DIMT; x < dimx + DIMT-2; ++ x)
-						{
-							if((XLB && x < 0) || (XRB && x >= dimx) || (YLB && y < 0) || (YRB && y >= dimy))
-								ES(t2buf, x, y, 0, t2dimx, t2dimy) = 0.0;
-							else
-								ES(t2buf, x, y, 0, t2dimx, t2dimy) = CENTER_WIGHT*ES(t1buf, x, y, 0, t1dimx, t1dimy) + ADJACENT_WIGHT * ( ES(t1buf, x-1, y, 0, t1dimx, t1dimy)
-								+ ES(t1buf, x+1, y, 0, t1dimx, t1dimy)
-								+ ES(t1buf, x, y-1, 0, t1dimx, t1dimy)
-								+ ES(t1buf, x, y+1, 0, t1dimx, t1dimy)
-								+ ES(t1buf, x, y, 1, t1dimx, t1dimy) );
-						}
-					}
-
-				}
-				else
-				{
-					for(y = 2 - DIMT; y < wc + DIMT-2; ++ y)
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+							+ *(y_m1_stream+x) + *(y_a1_stream+x)
+							+ *(z_m1_stream+x) + *(z_a1_stream+x));
+					}*/
+					for(x = 2 - DIMT; x+3 < dimx+DIMT-2; x += 4)
 					{
-						for(x = 2 - DIMT; x < dimx + DIMT-2; ++ x)
-						{
-							if((XLB && x < 0) || (XRB && x >= dimx) || (YLB && y < 0) || (YRB && y >= dimy))
-								ES(t2buf, x, y, zm1, t2dimx, t2dimy) = 0.0;
-							else
-								ES(t2buf, x, y, zm1, t2dimx, t2dimy) = CENTER_WIGHT*ES(t1buf, x, y, zm1, t1dimx, t1dimy) + ADJACENT_WIGHT * ( ES(t1buf, x-1, y, zm1, t1dimx, t1dimy)
-								+ ES(t1buf, x+1, y, zm1, t1dimx, t1dimy)
-								+ ES(t1buf, x, y-1, zm1, t1dimx, t1dimy)
-								+ ES(t1buf, x, y+1, zm1, t1dimx, t1dimy)
-								+ ES(t1buf, x, y, (zm1-1 + dimt)%dimt, t1dimx, t1dimy)
-								+ ES(t1buf, x, y, (zm1+1)%dimt, t1dimx, t1dimy) );
-						}
+						vc   = _mm256_load_pd(x_stream+x);				
+						vxm1 = _mm256_load_pd(x_stream+x-1);
+						vc   = _mm256_mul_pd(vc, cw);
+						vxa1 = _mm256_load_pd(x_stream+x+1);
+						vc   = _mm256_fmadd_pd(vxm1, aw, vc);
+						vym1 = _mm256_load_pd(y_m1_stream+x);
+						vc   = _mm256_fmadd_pd(vxa1, aw, vc);
+						vya1 = _mm256_load_pd(y_a1_stream+x);
+						vc   = _mm256_fmadd_pd(vym1, aw, vc);
+						vzm1 = _mm256_load_pd(z_m1_stream+x);
+						vc   = _mm256_fmadd_pd(vya1, aw, vc);
+						vza1 = _mm256_load_pd(z_a1_stream+x);
+						vc   = _mm256_fmadd_pd(vzm1, aw, vc);
+						vc   = _mm256_fmadd_pd(vza1, aw, vc);
+						_mm256_store_pd(out_center+x, vc);
 					}
+					//x -= 4;
+					for(; x < dimx+DIMT-2; ++x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+								+ *(y_m1_stream+x) + *(y_a1_stream+x)
+								+ *(z_m1_stream+x) + *(z_a1_stream+x));
 
+					}
 				}
+
 			}
 #ifdef PRINT_DEBUG
 			printf("iter2 z== : %d\n", z);
@@ -194,38 +269,46 @@ void compute_subplane(grid_data* pgd, grid_data* subgrid, int dimx, int dimy, in
 			if(z >= 2 && dimt == 3)
 			{
 				zm2 = (z-2) % dimt; 
-				if(z == 2)
+				for(y = offset; y < wc+offset; ++ y)
 				{
-					for(y = 0; y < wc; ++ y)
+					out_center = &(E(outsubgrid, 0, y, z-2));
+					x_stream = &(ES(t2buf, 0, y, zm2, t2dimx, t2dimy));
+					y_m1_stream = &(ES(t2buf, 0, y-1, zm2, t2dimx, t2dimy));
+					y_a1_stream = &(ES(t2buf, 0, y+1, zm2, t2dimx, t2dimy));
+					z_m1_stream = &(ES(t2buf, 0, y, (zm2-1+dimt)%dimt, t2dimx, t2dimy));
+					z_a1_stream = &(ES(t2buf, 0, y, (zm2+1)%dimt, t2dimx, t2dimy));
+					/*for(x = 0; x < dimx; ++ x)
 					{
-						for(x = 0; x < dimx; ++ x)
-						{
-							E(outsubgrid, x, y, 0) = CENTER_WIGHT*ES(t2buf, x, y, 0, t2dimx, t2dimy) + ADJACENT_WIGHT * ( ES(t2buf, x-1, y, 0, t2dimx, t2dimy)
-								+ ES(t2buf, x+1, y, 0, t2dimx, t2dimy)
-								+ ES(t2buf, x, y-1, 0, t2dimx, t2dimy)
-								+ ES(t2buf, x, y+1, 0, t2dimx, t2dimy)
-								+ ES(t2buf, x, y, 1, t2dimx, t2dimy) );
-							
-						}
-					}
-
-				}
-				else
-				{
-					for(y = 0; y < wc; ++ y)
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+							+ *(y_m1_stream+x) + *(y_a1_stream+x)
+							+ *(z_m1_stream+x) + *(z_a1_stream+x));
+					}*/
+					for(x = 0; x+3 < dimx; x += 4)
 					{
-						for(x = 0; x < dimx; ++ x)
-						{
-							E(outsubgrid, x, y, z-2) = CENTER_WIGHT*ES(t2buf, x, y, zm2, t2dimx, t2dimy) + ADJACENT_WIGHT * ( ES(t2buf, x-1, y, zm2, t2dimx, t2dimy)
-								+ ES(t2buf, x+1, y, zm2, t2dimx, t2dimy)
-								+ ES(t2buf, x, y-1, zm2, t2dimx, t2dimy)
-								+ ES(t2buf, x, y+1, zm2, t2dimx, t2dimy)
-								+ ES(t2buf, x, y, (zm2-1+dimt)%dimt, t2dimx, t2dimy) 
-								+ ES(t2buf, x, y, (zm2+1)%dimt, t2dimx, t2dimy));
-							
-						}
+						vc   = _mm256_load_pd(x_stream+x);				
+						vxm1 = _mm256_load_pd(x_stream+x-1);
+						vc   = _mm256_mul_pd(vc, cw);
+						vxa1 = _mm256_load_pd(x_stream+x+1);
+						vc   = _mm256_fmadd_pd(vxm1, aw, vc);
+						vym1 = _mm256_load_pd(y_m1_stream+x);
+						vc   = _mm256_fmadd_pd(vxa1, aw, vc);
+						vya1 = _mm256_load_pd(y_a1_stream+x);
+						vc   = _mm256_fmadd_pd(vym1, aw, vc);
+						vzm1 = _mm256_load_pd(z_m1_stream+x);
+						vc   = _mm256_fmadd_pd(vya1, aw, vc);
+						vza1 = _mm256_load_pd(z_a1_stream+x);
+						vc   = _mm256_fmadd_pd(vzm1, aw, vc);
+						vc   = _mm256_fmadd_pd(vza1, aw, vc);
+						_mm256_store_pd(out_center+x, vc);
 					}
+					//x -= 4;
+					for(; x < dimx; ++x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+								+ *(y_m1_stream+x) + *(y_a1_stream+x)
+								+ *(z_m1_stream+x) + *(z_a1_stream+x));
 
+					}
 				}
 			}
 #ifdef PRINT_DEBUG
@@ -246,48 +329,130 @@ void compute_subplane(grid_data* pgd, grid_data* subgrid, int dimx, int dimy, in
 		//z = Nz - 2
 		if(dimt == 3)
 		{
-			int zm = (Nz - 1) % dimt;
-			for(y = 2 - DIMT; y < wc + DIMT-2; ++ y)
+			zm0 = (Nz - 1) % dimt;
+			for(y = 2 - DIMT + offset; y < wc + DIMT-2 + offset; ++ y)
 			{
-				for(x = 2 - DIMT; x < dimx + DIMT-2; ++ x)
+				out_center = &(ES(t2buf, 0, y, zm0, t2dimx, t2dimy));
+				x_stream = &(ES(t1buf, 0, y, zm0, t1dimx, t1dimy));
+				y_m1_stream = &(ES(t1buf, 0, y-1, zm0, t1dimx, t1dimy));
+				y_a1_stream = &(ES(t1buf, 0, y+1, zm0, t1dimx, t1dimy));
+				z_m1_stream = &(ES(t1buf, 0, y, (zm0-1+dimt)%dimt, t1dimx, t1dimy));
+				//z_a1_stream = &(ES(t1buf, 0, y, (zm0+1)%dimt, t1dimx, t1dimy));
+				/*for(x = 2 - DIMT; x < dimx + DIMT-2; ++ x)
 				{
-					if((XLB && x < 0) || (XRB && x >= dimx) || (YLB && y < 0) || (YRB && y >= dimy))
-						ES(t2buf, x, y, zm, t2dimx, t2dimy) = 0.0;
-					else
-						ES(t2buf, x, y, zm, t2dimx, t2dimy) = CENTER_WIGHT*ES(t1buf, x, y, zm, t1dimx, t1dimy) + ADJACENT_WIGHT * ( 
-						ES(t1buf, x-1, y, zm, t1dimx, t1dimy)
-						+ ES(t1buf, x+1, y, zm, t1dimx, t1dimy)
-						+ ES(t1buf, x, y-1, zm, t1dimx, t1dimy)
-						+ ES(t1buf, x, y+1, zm, t1dimx, t1dimy)
-						+ ES(t1buf, x, y, (zm-1 + dimt)%dimt, t1dimx, t1dimy));
-				}
+					*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+						+ *(y_m1_stream+x) + *(y_a1_stream+x)
+						+ *(z_m1_stream+x) + *(z_a1_stream+x));
+				}*/
+					for(x = 2 - DIMT; x+3 < dimx+DIMT-2; x += 4)
+					{
+						vc   = _mm256_load_pd(x_stream+x);				
+						vxm1 = _mm256_load_pd(x_stream+x-1);
+						vc   = _mm256_mul_pd(vc, cw);
+						vxa1 = _mm256_load_pd(x_stream+x+1);
+						vc   = _mm256_fmadd_pd(vxm1, aw, vc);
+						vym1 = _mm256_load_pd(y_m1_stream+x);
+						vc   = _mm256_fmadd_pd(vxa1, aw, vc);
+						vya1 = _mm256_load_pd(y_a1_stream+x);
+						vc   = _mm256_fmadd_pd(vym1, aw, vc);
+						vzm1 = _mm256_load_pd(z_m1_stream+x);
+						vc   = _mm256_fmadd_pd(vya1, aw, vc);
+						//vza1 = _mm256_load_pd(z_a1_stream+x);
+						vc   = _mm256_fmadd_pd(vzm1, aw, vc);
+						//vc   = _mm256_fmadd_pd(vza1, aw, vc);
+						_mm256_store_pd(out_center+x, vc);
+					}
+					//x -= 4;
+					for(; x < dimx+DIMT-2; ++x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+								+ *(y_m1_stream+x) + *(y_a1_stream+x)
+								+ *(z_m1_stream+x));
+
+					}
 			}
-			zm = (Nz - 2) % dimt;
-			for(y = 0; y < wc; ++ y)
+			zm0 = (Nz - 2) % dimt;
+			for(y = offset; y < wc+offset; ++ y)
 			{
-				for(x = 0; x < dimx; ++ x)
+				out_center = &(E(outsubgrid, 0, y, Nz-2));
+				x_stream = &(ES(t2buf, 0, y, zm0, t2dimx, t2dimy));
+				y_m1_stream = &(ES(t2buf, 0, y-1, zm0, t2dimx, t2dimy));
+				y_a1_stream = &(ES(t2buf, 0, y+1, zm0, t2dimx, t2dimy));
+				z_m1_stream = &(ES(t2buf, 0, y, (zm0-1+dimt)%dimt, t2dimx, t2dimy));
+				z_a1_stream = &(ES(t2buf, 0, y, (zm0+1)%dimt, t2dimx, t2dimy));
+				/*for(x = 0; x < dimx; ++ x)
 				{
-					E(outsubgrid, x, y, Nz-2) = CENTER_WIGHT*ES(t2buf, x, y, zm, t2dimx, t2dimy) + ADJACENT_WIGHT * ( ES(t2buf, x-1, y, zm, t2dimx, t2dimy)
-						+ ES(t2buf, x+1, y, zm, t2dimx, t2dimy)
-						+ ES(t2buf, x, y-1, zm, t2dimx, t2dimy)
-						+ ES(t2buf, x, y+1, zm, t2dimx, t2dimy)
-						+ ES(t2buf, x, y, (zm-1+dimt)%dimt, t2dimx, t2dimy) 
-						+ ES(t2buf, x, y, (zm+1)%dimt, t2dimx, t2dimy));
-					
-				}
+					*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+						+ *(y_m1_stream+x) + *(y_a1_stream+x)
+						+ *(z_m1_stream+x) + *(z_a1_stream+x));
+				}*/
+					for(x = 0; x+3 < dimx; x += 4)
+					{
+						vc   = _mm256_load_pd(x_stream+x);				
+						vxm1 = _mm256_load_pd(x_stream+x-1);
+						vc   = _mm256_mul_pd(vc, cw);
+						vxa1 = _mm256_load_pd(x_stream+x+1);
+						vc   = _mm256_fmadd_pd(vxm1, aw, vc);
+						vym1 = _mm256_load_pd(y_m1_stream+x);
+						vc   = _mm256_fmadd_pd(vxa1, aw, vc);
+						vya1 = _mm256_load_pd(y_a1_stream+x);
+						vc   = _mm256_fmadd_pd(vym1, aw, vc);
+						vzm1 = _mm256_load_pd(z_m1_stream+x);
+						vc   = _mm256_fmadd_pd(vya1, aw, vc);
+						vza1 = _mm256_load_pd(z_a1_stream+x);
+						vc   = _mm256_fmadd_pd(vzm1, aw, vc);
+						vc   = _mm256_fmadd_pd(vza1, aw, vc);
+						_mm256_store_pd(out_center+x, vc);
+					}
+					//x -= 4;
+					for(; x < dimx; ++x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+								+ *(y_m1_stream+x) + *(y_a1_stream+x)
+								+ *(z_m1_stream+x) + *(z_a1_stream+x));
+
+					}
 			}
-			zm = (Nz - 1) % dimt;
-			for(y = 0; y < wc; ++ y)
+			zm0 = (Nz - 1) % dimt;
+			for(y = offset; y < wc+offset; ++ y)
 			{
-				for(x = 0; x < dimx; ++ x)
+				out_center = &(E(outsubgrid, 0, y, Nz-1));
+				x_stream = &(ES(t2buf, 0, y, zm0, t2dimx, t2dimy));
+				y_m1_stream = &(ES(t2buf, 0, y-1, zm0, t2dimx, t2dimy));
+				y_a1_stream = &(ES(t2buf, 0, y+1, zm0, t2dimx, t2dimy));
+				z_m1_stream = &(ES(t2buf, 0, y, (zm0-1+dimt)%dimt, t2dimx, t2dimy));
+				/*for(x = 0; x < dimx; ++ x)
 				{
-					E(outsubgrid, x, y, Nz-1) = CENTER_WIGHT*ES(t2buf, x, y, zm, t2dimx, t2dimy) + ADJACENT_WIGHT * ( ES(t2buf, x-1, y, zm, t2dimx, t2dimy)
-						+ ES(t2buf, x+1, y, zm, t2dimx, t2dimy)
-						+ ES(t2buf, x, y-1, zm, t2dimx, t2dimy)
-						+ ES(t2buf, x, y+1, zm, t2dimx, t2dimy)
-						+ ES(t2buf, x, y, (zm-1+dimt)%dimt, t2dimx, t2dimy));
-					
-				}
+					*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+						+ *(y_m1_stream+x) + *(y_a1_stream+x)
+						+ *(z_m1_stream+x));
+				}*/
+					for(x = 0; x+3 < dimx; x += 4)
+					{
+						vc   = _mm256_load_pd(x_stream+x);				
+						vxm1 = _mm256_load_pd(x_stream+x-1);
+						vc   = _mm256_mul_pd(vc, cw);
+						vxa1 = _mm256_load_pd(x_stream+x+1);
+						vc   = _mm256_fmadd_pd(vxm1, aw, vc);
+						vym1 = _mm256_load_pd(y_m1_stream+x);
+						vc   = _mm256_fmadd_pd(vxa1, aw, vc);
+						vya1 = _mm256_load_pd(y_a1_stream+x);
+						vc   = _mm256_fmadd_pd(vym1, aw, vc);
+						vzm1 = _mm256_load_pd(z_m1_stream+x);
+						vc   = _mm256_fmadd_pd(vya1, aw, vc);
+						//vza1 = _mm256_load_pd(z_a1_stream+x);
+						vc   = _mm256_fmadd_pd(vzm1, aw, vc);
+						//vc   = _mm256_fmadd_pd(vza1, aw, vc);
+						_mm256_store_pd(out_center+x, vc);
+					}
+					//x -= 4;
+					for(; x < dimx; ++x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+								+ *(y_m1_stream+x) + *(y_a1_stream+x)
+								+ *(z_m1_stream+x) );
+
+					}
 			}
 		}
 		
@@ -295,15 +460,648 @@ void compute_subplane(grid_data* pgd, grid_data* subgrid, int dimx, int dimy, in
 
 }
 
+void compute_boundary(grid_data* pgd, grid_data* subgrid, int dimx, int dimy, int dimt, grid_data* outsubgrid)
+{
+	//if(dimt == 1)
+	//{
+		memset(bufferB1_1, 0, (dimx+2)*(BOUNDARY_OFFSET+DIMT)*3*8);
+		memset(bufferB1_2, 0, (dimx+2)*(BOUNDARY_OFFSET+DIMT-1)*3*8);
+		memset(bufferB2_1, 0, (dimx+2)*(BOUNDARY_OFFSET+DIMT)*3*8);
+		memset(bufferB2_2, 0, (dimx+2)*(BOUNDARY_OFFSET+DIMT-1)*3*8);
+		memset(bufferB3_1, 0, (BOUNDARY_OFFSET+DIMT)*(dimy+2)*3*8);
+		memset(bufferB3_2, 0, (BOUNDARY_OFFSET+DIMT-1)*(dimy+2)*3*8);
+		memset(bufferB4_1, 0, (BOUNDARY_OFFSET+DIMT)*(dimy+2)*3*8);
+		memset(bufferB4_2, 0, (BOUNDARY_OFFSET+DIMT-1)*(dimy+2)*3*8);
+
+	//}
+	int Nx = subgrid->Nx;
+	int Ny = subgrid->Ny;
+	int Nz = subgrid->Nz;
+
+	//x from 0 to Nx-1, y from 0 to offset-1
+	#pragma omp parallel num_threads(4)
+	{
+	#pragma omp sections
+	{
+		#pragma omp section // x from 0 to Nz-1, y from 0 to offset-1
+		{
+			int x, y, z;
+			FT *x_stream, *y_m1_stream, *y_a1_stream, *z_m1_stream, *z_a1_stream, *out_center;
+			int t1dimx = dimx + 2, t1dimy = BOUNDARY_OFFSET + dimt;
+			int t2dimx = dimx + 2, t2dimy = BOUNDARY_OFFSET + dimt - 1;
+			int zm0, zm1, zm2;
+			FT *buf1 = &(ES(bufferB1_1, 1, 1, 0, t1dimx, t1dimy));
+			FT *buf2 = &(ES(bufferB1_2, 1, 1, 0, t2dimx, t2dimy));
+
+			for(z = 0; z < Nz; ++ z)
+			{
+				if(dimt == 1)
+				{
+					for(y = 0; y < BOUNDARY_OFFSET; ++ y)
+					{
+						out_center = &(E(outsubgrid, 0, y, z));
+						x_stream = &(E(subgrid, 0, y, z));
+						y_m1_stream = &(E(subgrid, 0, y-1, z));
+						y_a1_stream = &(E(subgrid, 0, y+1, z));
+						z_m1_stream = &(E(subgrid, 0, y, z-1));
+						z_a1_stream = &(E(subgrid, 0, y, z+1));
+						for(x = 0; x < Nx; ++ x)
+						{
+							*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+									+ *(y_m1_stream + x) + *(y_a1_stream + x)
+									+ *(z_m1_stream + x) + *(z_a1_stream + x));
+						}
+
+					}
+
+				}
+				else
+				{
+					for(y = 0; y < BOUNDARY_OFFSET + dimt-1; ++ y)
+					{
+						out_center = &(ES(buf1, 0, y, z%dimt, t1dimx, t1dimy));
+						x_stream = &(E(subgrid, 0, y, z));
+						y_m1_stream = &(E(subgrid, 0, y-1, z));
+						y_a1_stream = &(E(subgrid, 0, y+1, z));
+						z_m1_stream = &(E(subgrid, 0, y, z-1));
+						z_a1_stream = &(E(subgrid, 0, y, z+1));
+						for(x = 0; x < Nx; ++ x)
+						{
+							*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+									+ *(y_m1_stream + x) + *(y_a1_stream + x)
+									+ *(z_m1_stream + x) + *(z_a1_stream + x));
+						}
+
+					}
+					if(z >= 1 && dimt >= 2)
+					{
+						for(y = 0; y < BOUNDARY_OFFSET + dimt-2; ++ y)
+						{
+							//y == 0 subplane
+							zm1 = (z-1)%dimt;
+							out_center = &(ES(buf2, 0, y, zm1, t2dimx, t2dimy));
+							x_stream = &(ES(buf1, 0, y, zm1, t1dimx, t1dimy));
+							y_m1_stream = &(ES(buf1, 0, y-1, zm1, t1dimx, t1dimy));
+							y_a1_stream = &(ES(buf1, 0, y+1, zm1, t1dimx, t1dimy));
+							z_m1_stream = &(ES(buf1, 0, y, (zm1-1+dimt)%dimt, t1dimx, t1dimy));
+							z_a1_stream = &(ES(buf1, 0, y, (zm1+1)%dimt, t1dimx, t1dimy));
+							for(x = 0; x < Nx; ++ x)
+							{
+								*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+										+ *(y_m1_stream + x) + *(y_a1_stream + x)
+										+ *(z_m1_stream + x) + *(z_a1_stream + x));
+							}
+						}
+
+					}
+					if(z >= 2 && dimt == 3)
+					{
+						for(y = 0; y < BOUNDARY_OFFSET; ++ y)
+						{
+							//y == 0 subplane
+							zm2 = (z-2)%dimt;
+							out_center = &(E(outsubgrid, 0, y, z-2));
+							x_stream = &(ES(buf2, 0, y, zm2, t2dimx, t2dimy));
+							y_m1_stream = &(ES(buf2, 0, y-1, zm2, t2dimx, t2dimy));
+							y_a1_stream = &(ES(buf2, 0, y+1, zm2, t2dimx, t2dimy));
+							z_m1_stream = &(ES(buf2, 0, y, (zm2-1+dimt)%dimt, t2dimx, t2dimy));
+							z_a1_stream = &(ES(buf2, 0, y, (zm2+1)%dimt, t2dimx, t2dimy));
+							for(x = 0; x < Nx; ++ x)
+							{
+								*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+										+ *(y_m1_stream + x) + *(y_a1_stream + x)
+										+ *(z_m1_stream + x) + *(z_a1_stream + x));
+							}
+						}
+
+					}
+
+				}
+			
+			}
+
+			if(dimt == 3)
+			{
+				zm0 = (Nz - 1) % dimt;
+				for(y = 0; y < BOUNDARY_OFFSET + dimt-2; ++ y)
+				{
+					out_center = &(ES(buf2, 0, y, zm0, t2dimx, t2dimy));
+					x_stream = &(ES(buf1, 0, y, zm0, t1dimx, t1dimy));
+					y_m1_stream = &(ES(buf1, 0, y-1, zm0, t1dimx, t1dimy));
+					y_a1_stream = &(ES(buf1, 0, y+1, zm0, t1dimx, t1dimy));
+					z_m1_stream = &(ES(buf1, 0, y, (zm0-1+dimt)%dimt, t1dimx, t1dimy));
+					//z_a1_stream = &(ES(buf1, 0, y, (zm0+1)%dimt, t1dimx, t1dimy));
+					for(x = 0; x < Nx; ++ x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+							+ *(y_m1_stream+x) + *(y_a1_stream+x)
+							+ *(z_m1_stream+x));
+					}
+				}
+				zm0 = (Nz - 2) % dimt;
+				for(y = 0; y < BOUNDARY_OFFSET; ++ y)
+				{
+					out_center = &(E(outsubgrid, 0, y, Nz-2));
+					x_stream = &(ES(buf2, 0, y, zm0, t2dimx, t2dimy));
+					y_m1_stream = &(ES(buf2, 0, y-1, zm0, t2dimx, t2dimy));
+					y_a1_stream = &(ES(buf2, 0, y+1, zm0, t2dimx, t2dimy));
+					z_m1_stream = &(ES(buf2, 0, y, (zm0-1+dimt)%dimt, t2dimx, t2dimy));
+					z_a1_stream = &(ES(buf2, 0, y, (zm0+1)%dimt, t2dimx, t2dimy));
+					for(x = 0; x < Nx; ++ x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+							+ *(y_m1_stream+x) + *(y_a1_stream+x)
+							+ *(z_m1_stream+x) + *(z_a1_stream+x));
+					}
+				}
+				zm0 = (Nz - 1) % dimt;
+				for(y = 0; y < BOUNDARY_OFFSET; ++ y)
+				{
+					out_center = &(E(outsubgrid, 0, y, Nz-1));
+					x_stream = &(ES(buf2, 0, y, zm0, t2dimx, t2dimy));
+					y_m1_stream = &(ES(buf2, 0, y-1, zm0, t2dimx, t2dimy));
+					y_a1_stream = &(ES(buf2, 0, y+1, zm0, t2dimx, t2dimy));
+					z_m1_stream = &(ES(buf2, 0, y, (zm0-1+dimt)%dimt, t2dimx, t2dimy));
+					for(x = 0; x < Nx; ++ x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+							+ *(y_m1_stream+x) + *(y_a1_stream+x)
+							+ *(z_m1_stream+x));
+					}
+				}
+			
+			}
+
+		}
+
+		#pragma omp section  // x from 0 to Nz-1, y from Ny-offset to Ny - 1
+		{
+			int x, y, z;
+			FT *x_stream, *y_m1_stream, *y_a1_stream, *z_m1_stream, *z_a1_stream, *out_center;
+			int t1dimx = dimx + 2, t1dimy = BOUNDARY_OFFSET + dimt;
+			int t2dimx = dimx + 2, t2dimy = BOUNDARY_OFFSET + dimt - 1;
+			int zm0, zm1, zm2;
+			FT *buf1 = &(ES(bufferB2_1, 1, 0, 0, t1dimx, t1dimy));
+			FT *buf2 = &(ES(bufferB2_2, 1, 0, 0, t2dimx, t2dimy));
+
+			for(z = 0; z < Nz; ++ z)
+			{
+				if(dimt == 1)
+				{
+					for(y = Ny-BOUNDARY_OFFSET; y < Ny; ++ y)
+					{
+						out_center = &(E(outsubgrid, 0, y, z));
+						x_stream = &(E(subgrid, 0, y, z));
+						y_m1_stream = &(E(subgrid, 0, y-1, z));
+						y_a1_stream = &(E(subgrid, 0, y+1, z));
+						z_m1_stream = &(E(subgrid, 0, y, z-1));
+						z_a1_stream = &(E(subgrid, 0, y, z+1));
+						for(x = 0; x < Nx; ++ x)
+						{
+							*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+									+ *(y_m1_stream + x) + *(y_a1_stream + x)
+									+ *(z_m1_stream + x) + *(z_a1_stream + x));
+						}
+
+					}
+
+				}
+				else
+				{
+					int startY = Ny-BOUNDARY_OFFSET-dimt+1;
+					//for(y = startY; y < Ny; ++ y)
+					for(y = 0; y < BOUNDARY_OFFSET+dimt-1; ++ y)
+					{
+						out_center = &(ES(buf1, 0, y, z%dimt, t1dimx, t1dimy));
+						x_stream = &(E(subgrid, 0, y+startY, z));
+						y_m1_stream = &(E(subgrid, 0, y-1+startY, z));
+						y_a1_stream = &(E(subgrid, 0, y+1+startY, z));
+						z_m1_stream = &(E(subgrid, 0, y+startY, z-1));
+						z_a1_stream = &(E(subgrid, 0, y+startY, z+1));
+						for(x = 0; x < Nx; ++ x)
+						{
+							*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+									+ *(y_m1_stream + x) + *(y_a1_stream + x)
+									+ *(z_m1_stream + x) + *(z_a1_stream + x));
+						}
+
+					}
+					if(z >= 1 && dimt >= 2)
+					{
+						//for(y = Ny-BOUNDARY_OFFSET-dimt+2; y < Ny; ++ y)
+						for(y = 0; y < BOUNDARY_OFFSET+dimt-2; ++y)
+						{
+							//y == 0 subplane
+							zm1 = (z-1)%dimt;
+							out_center = &(ES(buf2, 0, y, zm1, t2dimx, t2dimy));
+							x_stream = &(ES(buf1, 0, y+1, zm1, t1dimx, t1dimy));
+							y_m1_stream = &(ES(buf1, 0, y-1+1, zm1, t1dimx, t1dimy));
+							y_a1_stream = &(ES(buf1, 0, y+1+1, zm1, t1dimx, t1dimy));
+							z_m1_stream = &(ES(buf1, 0, y+1, (zm1-1+dimt)%dimt, t1dimx, t1dimy));
+							z_a1_stream = &(ES(buf1, 0, y+1, (zm1+1)%dimt, t1dimx, t1dimy));
+							for(x = 0; x < Nx; ++ x)
+							{
+								*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+										+ *(y_m1_stream + x) + *(y_a1_stream + x)
+										+ *(z_m1_stream + x) + *(z_a1_stream + x));
+							}
+						}
+
+					}
+					if(z >= 2 && dimt == 3)
+					{
+						startY = Ny-BOUNDARY_OFFSET;
+						for(y = 0; y < BOUNDARY_OFFSET; ++ y)
+						{
+							//y == 0 subplane
+							zm2 = (z-2)%dimt;
+							out_center = &(E(outsubgrid, 0, y+startY, z-2));
+							x_stream = &(ES(buf2, 0, y+1, zm2, t2dimx, t2dimy));
+							y_m1_stream = &(ES(buf2, 0, y-1+1, zm2, t2dimx, t2dimy));
+							y_a1_stream = &(ES(buf2, 0, y+1+1, zm2, t2dimx, t2dimy));
+							z_m1_stream = &(ES(buf2, 0, y+1, (zm2-1+dimt)%dimt, t2dimx, t2dimy));
+							z_a1_stream = &(ES(buf2, 0, y+1, (zm2+1)%dimt, t2dimx, t2dimy));
+							for(x = 0; x < Nx; ++ x)
+							{
+								*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+										+ *(y_m1_stream + x) + *(y_a1_stream + x)
+										+ *(z_m1_stream + x) + *(z_a1_stream + x));
+							}
+						}
+
+					}
+				}
+			}
+			if(dimt == 3)
+			{
+				zm0 = (Nz - 1) % dimt;
+				//for(y = Ny-BOUNDARY_OFFSET-dimt+2; y < Ny; ++ y)
+				for(y = 0; y < BOUNDARY_OFFSET+dimt-2; ++ y)
+				{
+					out_center = &(ES(buf2, 0, y, zm0, t2dimx, t2dimy));
+					x_stream = &(ES(buf1, 0, y+1, zm0, t1dimx, t1dimy));
+					y_m1_stream = &(ES(buf1, 0, y-1+1, zm0, t1dimx, t1dimy));
+					y_a1_stream = &(ES(buf1, 0, y+1+1, zm0, t1dimx, t1dimy));
+					z_m1_stream = &(ES(buf1, 0, y+1, (zm0-1+dimt)%dimt, t1dimx, t1dimy));
+					//z_a1_stream = &(ES(buf1, 0, y+1, (zm0+1)%dimt, t1dimx, t1dimy));
+					for(x = 0; x < Nx; ++ x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+							+ *(y_m1_stream+x) + *(y_a1_stream+x)
+							+ *(z_m1_stream+x));
+					}
+				}
+				zm0 = (Nz - 2) % dimt;
+				int startY = Ny-BOUNDARY_OFFSET;
+				for(y = 0; y < BOUNDARY_OFFSET; ++ y)
+				{
+					out_center = &(E(outsubgrid, 0, y+startY, Nz-2));
+					x_stream = &(ES(buf2, 0, y+1, zm0, t2dimx, t2dimy));
+					y_m1_stream = &(ES(buf2, 0, y-1+1, zm0, t2dimx, t2dimy));
+					y_a1_stream = &(ES(buf2, 0, y+1+1, zm0, t2dimx, t2dimy));
+					z_m1_stream = &(ES(buf2, 0, y+1, (zm0-1+dimt)%dimt, t2dimx, t2dimy));
+					z_a1_stream = &(ES(buf2, 0, y+1, (zm0+1)%dimt, t2dimx, t2dimy));
+					for(x = 0; x < Nx; ++ x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+							+ *(y_m1_stream+x) + *(y_a1_stream+x)
+							+ *(z_m1_stream+x) + *(z_a1_stream+x));
+					}
+				}
+				zm0 = (Nz - 1) % dimt;
+				for(y = 0; y < BOUNDARY_OFFSET; ++ y)
+				{
+					out_center = &(E(outsubgrid, 0, y+startY, Nz-1));
+					x_stream = &(ES(buf2, 0, y+1, zm0, t2dimx, t2dimy));
+					y_m1_stream = &(ES(buf2, 0, y-1+1, zm0, t2dimx, t2dimy));
+					y_a1_stream = &(ES(buf2, 0, y+1+1, zm0, t2dimx, t2dimy));
+					z_m1_stream = &(ES(buf2, 0, y+1, (zm0-1+dimt)%dimt, t2dimx, t2dimy));
+					for(x = 0; x < Nx; ++ x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+							+ *(y_m1_stream+x) + *(y_a1_stream+x)
+							+ *(z_m1_stream+x));
+					}
+				}
+			
+			}
+		}
+		
+		#pragma omp section  // x from 0 to offset-1, y from 0 to Ny-1
+		{
+			int x, y, z;
+			FT *x_stream, *y_m1_stream, *y_a1_stream, *z_m1_stream, *z_a1_stream, *out_center;
+			int t1dimx = BOUNDARY_OFFSET+dimt, t1dimy = dimy + 2;
+			int t2dimx = BOUNDARY_OFFSET+dimt-1, t2dimy = dimy + 2;
+			int zm0, zm1, zm2;
+			FT *buf1 = &(ES(bufferB3_1, 1, 1, 0, t1dimx, t1dimy));
+			FT *buf2 = &(ES(bufferB3_2, 1, 1, 0, t2dimx, t2dimy));
+			for(z = 0; z < Nz; ++z)
+			{
+				if(dimt == 1)
+				{
+					for(y = 0; y < Ny; ++ y)
+					{
+						out_center = &(E(outsubgrid, 0, y, z));
+						x_stream = &(E(subgrid, 0, y, z));
+						y_m1_stream = &(E(subgrid, 0, y-1, z));
+						y_a1_stream = &(E(subgrid, 0, y+1, z));
+						z_m1_stream = &(E(subgrid, 0, y, z-1));
+						z_a1_stream = &(E(subgrid, 0, y, z+1));
+						for(x = 0; x < BOUNDARY_OFFSET; ++ x)
+						{
+							*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+									+ *(y_m1_stream + x) + *(y_a1_stream + x)
+									+ *(z_m1_stream + x) + *(z_a1_stream + x));
+						}
+
+					}
+
+				}
+				else
+				{
+					for(y = 0; y < Ny; ++ y)
+					{
+						out_center = &(ES(buf1, 0, y, z%dimt, t1dimx, t1dimy));
+						x_stream = &(E(subgrid, 0, y, z));
+						y_m1_stream = &(E(subgrid, 0, y-1, z));
+						y_a1_stream = &(E(subgrid, 0, y+1, z));
+						z_m1_stream = &(E(subgrid, 0, y, z-1));
+						z_a1_stream = &(E(subgrid, 0, y, z+1));
+						for(x = 0; x < BOUNDARY_OFFSET+dimt-1; ++ x)
+						{
+							*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+									+ *(y_m1_stream + x) + *(y_a1_stream + x)
+									+ *(z_m1_stream + x) + *(z_a1_stream + x));
+						}
+
+					}
+					if(z >= 1 && dimt >= 2)
+					{
+						for(y = 0; y < Ny; ++ y)
+						{
+							//y == 0 subplane
+							zm1 = (z-1)%dimt;
+							out_center = &(ES(buf2, 0, y, zm1, t2dimx, t2dimy));
+							x_stream = &(ES(buf1, 0, y, zm1, t1dimx, t1dimy));
+							y_m1_stream = &(ES(buf1, 0, y-1, zm1, t1dimx, t1dimy));
+							y_a1_stream = &(ES(buf1, 0, y+1, zm1, t1dimx, t1dimy));
+							z_m1_stream = &(ES(buf1, 0, y, (zm1-1+dimt)%dimt, t1dimx, t1dimy));
+							z_a1_stream = &(ES(buf1, 0, y, (zm1+1)%dimt, t1dimx, t1dimy));
+							for(x = 0; x < BOUNDARY_OFFSET+dimt-2; ++ x)
+							{
+								*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+										+ *(y_m1_stream + x) + *(y_a1_stream + x)
+										+ *(z_m1_stream + x) + *(z_a1_stream + x));
+							}
+						}
+
+					}
+					if(z >= 2 && dimt == 3)
+					{
+						for(y = 0; y < Ny; ++ y)
+						{
+							//y == 0 subplane
+							zm2 = (z-2)%dimt;
+							out_center = &(E(outsubgrid, 0, y, z-2));
+							x_stream = &(ES(buf2, 0, y, zm2, t2dimx, t2dimy));
+							y_m1_stream = &(ES(buf2, 0, y-1, zm2, t2dimx, t2dimy));
+							y_a1_stream = &(ES(buf2, 0, y+1, zm2, t2dimx, t2dimy));
+							z_m1_stream = &(ES(buf2, 0, y, (zm2-1+dimt)%dimt, t2dimx, t2dimy));
+							z_a1_stream = &(ES(buf2, 0, y, (zm2+1)%dimt, t2dimx, t2dimy));
+							for(x = 0; x < BOUNDARY_OFFSET; ++ x)
+							{
+								*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+										+ *(y_m1_stream + x) + *(y_a1_stream + x)
+										+ *(z_m1_stream + x) + *(z_a1_stream + x));
+							}
+						}
+
+					}
+				}
+
+			}
+			if(dimt == 3)
+			{
+				zm0 = (Nz - 1) % dimt;
+				for(y = 0; y < Ny; ++ y)
+				{
+					out_center = &(ES(buf2, 0, y, zm0, t2dimx, t2dimy));
+					x_stream = &(ES(buf1, 0, y, zm0, t1dimx, t1dimy));
+					y_m1_stream = &(ES(buf1, 0, y-1, zm0, t1dimx, t1dimy));
+					y_a1_stream = &(ES(buf1, 0, y+1, zm0, t1dimx, t1dimy));
+					z_m1_stream = &(ES(buf1, 0, y, (zm0-1+dimt)%dimt, t1dimx, t1dimy));
+					//z_a1_stream = &(ES(buf1, 0, y, (zm0+1)%dimt, t1dimx, t1dimy));
+					for(x = 0; x < BOUNDARY_OFFSET+dimt-2; ++ x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+							+ *(y_m1_stream+x) + *(y_a1_stream+x)
+							+ *(z_m1_stream+x));
+					}
+				}
+				zm0 = (Nz - 2) % dimt;
+				for(y = 0; y < Ny; ++ y)
+				{
+					out_center = &(E(outsubgrid, 0, y, Nz-2));
+					x_stream = &(ES(buf2, 0, y, zm0, t2dimx, t2dimy));
+					y_m1_stream = &(ES(buf2, 0, y-1, zm0, t2dimx, t2dimy));
+					y_a1_stream = &(ES(buf2, 0, y+1, zm0, t2dimx, t2dimy));
+					z_m1_stream = &(ES(buf2, 0, y, (zm0-1+dimt)%dimt, t2dimx, t2dimy));
+					z_a1_stream = &(ES(buf2, 0, y, (zm0+1)%dimt, t2dimx, t2dimy));
+					for(x = 0; x < BOUNDARY_OFFSET; ++ x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+							+ *(y_m1_stream+x) + *(y_a1_stream+x)
+							+ *(z_m1_stream+x) + *(z_a1_stream+x));
+					}
+				}
+				zm0 = (Nz - 1) % dimt;
+				for(y = 0; y < Ny; ++ y)
+				{
+					out_center = &(E(outsubgrid, 0, y, Nz-1));
+					x_stream = &(ES(buf2, 0, y, zm0, t2dimx, t2dimy));
+					y_m1_stream = &(ES(buf2, 0, y-1, zm0, t2dimx, t2dimy));
+					y_a1_stream = &(ES(buf2, 0, y+1, zm0, t2dimx, t2dimy));
+					z_m1_stream = &(ES(buf2, 0, y, (zm0-1+dimt)%dimt, t2dimx, t2dimy));
+					for(x = 0; x < BOUNDARY_OFFSET; ++ x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+							+ *(y_m1_stream+x) + *(y_a1_stream+x)
+							+ *(z_m1_stream+x));
+					}
+				}
+
+			}
+		}
+		#pragma omp section  // x from Nx-offset to Nx-1, y from 0 to Ny-1
+		{
+			int x, y, z;
+			FT *x_stream, *y_m1_stream, *y_a1_stream, *z_m1_stream, *z_a1_stream, *out_center;
+			int t1dimx = BOUNDARY_OFFSET+dimt, t1dimy = dimy + 2;
+			int t2dimx = BOUNDARY_OFFSET+dimt-1, t2dimy = dimy + 2;
+			int zm0, zm1, zm2;
+			FT *buf1 = &(ES(bufferB4_1, 0, 1, 0, t1dimx, t1dimy));
+			FT *buf2 = &(ES(bufferB4_2, 0, 1, 0, t2dimx, t2dimy));
+			for(z = 0; z < Nz; ++z)
+			{
+				if(dimt == 1)
+				{
+					for(y = 0; y < Ny; ++ y)
+					{
+						out_center = &(E(outsubgrid, 0, y, z));
+						x_stream = &(E(subgrid, 0, y, z));
+						y_m1_stream = &(E(subgrid, 0, y-1, z));
+						y_a1_stream = &(E(subgrid, 0, y+1, z));
+						z_m1_stream = &(E(subgrid, 0, y, z-1));
+						z_a1_stream = &(E(subgrid, 0, y, z+1));
+						for(x = Nx-BOUNDARY_OFFSET; x < Nx; ++ x)
+						{
+							*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+									+ *(y_m1_stream + x) + *(y_a1_stream + x)
+									+ *(z_m1_stream + x) + *(z_a1_stream + x));
+						}
+
+					}
+
+				}
+				else
+				{
+					int startX = Nx-BOUNDARY_OFFSET-dimt+1;
+					for(y = 0; y < Ny; ++ y)
+					{
+						out_center = &(ES(buf1, 0, y, z%dimt, t1dimx, t1dimy));
+						x_stream = &(E(subgrid, startX, y, z));
+						y_m1_stream = &(E(subgrid, startX, y-1, z));
+						y_a1_stream = &(E(subgrid, startX, y+1, z));
+						z_m1_stream = &(E(subgrid, startX, y, z-1));
+						z_a1_stream = &(E(subgrid, startX, y, z+1));
+						//for(x = Nx-BOUNDARY_OFFSET-dimt+1; x < Nx; ++ x)
+						for(x = 0; x < BOUNDARY_OFFSET + dimt - 1; ++ x)
+						{
+							*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+									+ *(y_m1_stream + x) + *(y_a1_stream + x)
+									+ *(z_m1_stream + x) + *(z_a1_stream + x));
+						}
+
+					}
+					if(z >= 1 && dimt >= 2)
+					{
+						for(y = 0; y < Ny; ++ y)
+						{
+							//y == 0 subplane
+							zm1 = (z-1)%dimt;
+							out_center = &(ES(buf2, 0, y, zm1, t2dimx, t2dimy));
+							x_stream = &(ES(buf1, 1, y, zm1, t1dimx, t1dimy));
+							y_m1_stream = &(ES(buf1, 1, y-1, zm1, t1dimx, t1dimy));
+							y_a1_stream = &(ES(buf1, 1, y+1, zm1, t1dimx, t1dimy));
+							z_m1_stream = &(ES(buf1, 1, y, (zm1-1+dimt)%dimt, t1dimx, t2dimy));
+							z_a1_stream = &(ES(buf1, 1, y, (zm1+1)%dimt, t1dimx, t2dimy));
+							//for(x = Nx-BOUNDARY_OFFSET-dimt+2; x < Nx; ++ x)
+							for(x = 0; x < BOUNDARY_OFFSET+dimt-2; ++ x)
+							{
+								*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+										+ *(y_m1_stream + x) + *(y_a1_stream + x)
+										+ *(z_m1_stream + x) + *(z_a1_stream + x));
+							}
+						}
+
+					}
+
+					if(z >= 2 && dimt == 3)
+					{
+						startX = Nx-BOUNDARY_OFFSET;
+						for(y = 0; y < Ny; ++ y)
+						{
+							//y == 0 subplane
+							zm2 = (z-2)%dimt;
+							out_center = &(E(outsubgrid, startX, y, z-2));
+							x_stream = &(ES(buf2, 1, y, zm2, t2dimx, t2dimy));
+							y_m1_stream = &(ES(buf2, 1, y-1, zm2, t2dimx, t2dimy));
+							y_a1_stream = &(ES(buf2, 1, y+1, zm2, t2dimx, t2dimy));
+							z_m1_stream = &(ES(buf2, 1, y, (zm2-1+dimt)%dimt, t2dimx, t2dimy));
+							z_a1_stream = &(ES(buf2, 1, y, (zm2+1)%dimt, t2dimx, t2dimy));
+							for(x = 0; x < BOUNDARY_OFFSET; ++ x)
+							{
+								*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1) 
+										+ *(y_m1_stream + x) + *(y_a1_stream + x)
+										+ *(z_m1_stream + x) + *(z_a1_stream + x));
+							}
+						}
+
+					}
+				}
+
+			}
+			if(dimt == 3)
+			{
+				zm0 = (Nz - 1) % dimt;
+				for(y = 0; y < Ny; ++ y)
+				{
+					out_center = &(ES(buf2, 0, y, zm0, t2dimx, t2dimy));
+					x_stream = &(ES(buf1, 1, y, zm0, t1dimx, t1dimy));
+					y_m1_stream = &(ES(buf1, 1, y-1, zm0, t1dimx, t1dimy));
+					y_a1_stream = &(ES(buf1, 1, y+1, zm0, t1dimx, t1dimy));
+					z_m1_stream = &(ES(buf1, 1, y, (zm0-1+dimt)%dimt, t1dimx, t1dimy));
+					//z_a1_stream = &(ES(buf1, 1, y, (zm0+1)%dimt, t1dimx, t1dimy));
+					//for(x = Nx-BOUNDARY_OFFSET-dimt+2; x < Nx; ++ x)
+					for(x = 0; x < BOUNDARY_OFFSET + dimt -2 ; ++x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+							+ *(y_m1_stream+x) + *(y_a1_stream+x)
+							+ *(z_m1_stream+x));
+					}
+				}
+				zm0 = (Nz - 2) % dimt;
+				int startX = Nx-BOUNDARY_OFFSET;
+				for(y = 0; y < Ny; ++ y)
+				{
+					out_center = &(E(outsubgrid, startX, y, Nz-2));
+					x_stream = &(ES(buf2, 1, y, zm0, t2dimx, t2dimy));
+					y_m1_stream = &(ES(buf2, 1, y-1, zm0, t2dimx, t2dimy));
+					y_a1_stream = &(ES(buf2, 1, y+1, zm0, t2dimx, t2dimy));
+					z_m1_stream = &(ES(buf2, 1, y, (zm0-1+dimt)%dimt, t2dimx, t2dimy));
+					z_a1_stream = &(ES(buf2, 1, y, (zm0+1)%dimt, t2dimx, t2dimy));
+					//for(x = Nx-BOUNDARY_OFFSET; x < Nx; ++ x)
+					for(x = 0; x < BOUNDARY_OFFSET; ++ x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+							+ *(y_m1_stream+x) + *(y_a1_stream+x)
+							+ *(z_m1_stream+x) + *(z_a1_stream+x));
+					}
+				}
+				zm0 = (Nz - 1) % dimt;
+				for(y = 0; y < Ny; ++ y)
+				{
+					out_center = &(E(outsubgrid, startX, y, Nz-1));
+					x_stream = &(ES(buf2, 1, y, zm0, t2dimx, t2dimy));
+					y_m1_stream = &(ES(buf2, 1, y-1, zm0, t2dimx, t2dimy));
+					y_a1_stream = &(ES(buf2, 1, y+1, zm0, t2dimx, t2dimy));
+					z_m1_stream = &(ES(buf2, 1, y, (zm0-1+dimt)%dimt, t2dimx, t2dimy));
+					for(x = 0; x < BOUNDARY_OFFSET; ++ x)
+					{
+						*(out_center+x) = CENTER_WIGHT*(*(x_stream+x)) + ADJACENT_WIGHT * ( *(x_stream+x-1) + *(x_stream+x+1)
+							+ *(y_m1_stream+x) + *(y_a1_stream+x)
+							+ *(z_m1_stream+x));
+					}
+				}
+
+			}
+		}
+	}
+	}
+
+
+}
+
 void compute_stencil_iter(grid_data* pgd, int dimt, grid_data* out)
 {
-	int xw = (pgd->Nx + DIMX - 1) / DIMX, rx = (pgd->Nx) % DIMX;
-	int yw = (pgd->Ny + DIMY - 1) / DIMY, ry = (pgd->Ny) % DIMY;
+	int xw = (pgd->Nx - 2*BOUNDARY_OFFSET + DIMX - 1) / DIMX, rx = (pgd->Nx - 2*BOUNDARY_OFFSET) % DIMX;
+	int yw = (pgd->Ny - 2*BOUNDARY_OFFSET + DIMY - 1) / DIMY, ry = (pgd->Ny - 2*BOUNDARY_OFFSET) % DIMY;
 	int xwi, ywi, dimx, dimy;
 	grid_data subgrid;
 	subgrid.Nx = pgd->Nx;
 	subgrid.Ny = pgd->Ny;
-	subgrid.Nx = pgd->Nz;
+	subgrid.Nz = pgd->Nz;
 	subgrid.xstride = pgd->xstride;
 	subgrid.ystride = pgd->ystride;
 	subgrid.zstride = pgd->zstride;
@@ -312,7 +1110,7 @@ void compute_stencil_iter(grid_data* pgd, int dimt, grid_data* out)
 	grid_data outsubgrid;
 	outsubgrid.Nx = pgd->Nx;
 	outsubgrid.Ny = pgd->Ny;
-	outsubgrid.Nx = pgd->Nz;
+	outsubgrid.Nz = pgd->Nz;
 	outsubgrid.xstride = pgd->xstride;
 	outsubgrid.ystride = pgd->ystride;
 	outsubgrid.zstride = pgd->zstride;
@@ -324,11 +1122,35 @@ void compute_stencil_iter(grid_data* pgd, int dimt, grid_data* out)
 		for(ywi = 0; ywi < yw; ++ ywi)
 		{
 			dimy = (ywi != yw - 1 || !ry) ? DIMY : ry;
-			subgrid.data = &(E(pgd, xwi*DIMX+DIMT, ywi*DIMY+DIMT, 1));
-			outsubgrid.data = &(E(out, xwi*DIMX+DIMT, ywi*DIMY+DIMT, 1));
-			compute_subplane(pgd, &subgrid, dimx, dimy, dimt, &outsubgrid, xwi==0, xwi==xw-1, ywi==0, ywi==yw-1);
+			subgrid.data = &(E(pgd, xwi*DIMX+1+BOUNDARY_OFFSET, ywi*DIMY+1+BOUNDARY_OFFSET, 1));
+			outsubgrid.data = &(E(out, xwi*DIMX+1+BOUNDARY_OFFSET, ywi*DIMY+1+BOUNDARY_OFFSET, 1));
+			//compute the kernel of subplane
+			compute_subplane(pgd, &subgrid, dimx, dimy, dimt, &outsubgrid);
 		}
 	}
+
+	//compute the boundary
+	subgrid.data = &(E(pgd, 1, 1, 1));
+	outsubgrid.data = &(E(out, 1, 1, 1));
+	compute_boundary(pgd, &subgrid, pgd->Nx, pgd->Ny, dimt, &outsubgrid);
+}
+
+double sum_grid(grid_data* pgd)
+{
+	double res = 0.0;
+	size_t size = pgd->xstride * pgd->ystride * pgd->zstride;
+	for(size_t i = 0; i < size; ++i)
+		res += (pgd->data)[i];
+	return res;
+}
+
+double checkSum(PFT data, size_t Nx, size_t Ny, size_t Nz, size_t z)
+{
+	double res = 0.0;
+	for(size_t y = 0; y < Ny; ++y)
+		for(size_t x = 0; x < Nx; ++x)
+			res += ES(data, x, y, z, Nx, Ny);
+	return res;
 }
 
 void compute_stencil_3_5D(IT Nx, IT Ny, IT Nz, int NIter)
@@ -338,8 +1160,8 @@ void compute_stencil_3_5D(IT Nx, IT Ny, IT Nz, int NIter)
 	gd.Ny = Ny;
 	gd.Nz = Nz;
 	gd.NIter = NIter;
-	gd.xstride = Nx + 2*DIMT;
-	gd.ystride = Ny + 2*DIMT;
+	gd.xstride = Nx + 2;
+	gd.ystride = Ny + 2;
 	gd.zstride = Nz + 2;
 	gd.data = (PFT)_mm_malloc(gd.xstride * gd.ystride * gd.zstride * sizeof(FT), 64);
 
@@ -348,8 +1170,8 @@ void compute_stencil_3_5D(IT Nx, IT Ny, IT Nz, int NIter)
 	gd2.Ny = Ny;
 	gd2.Nz = Nz;
 	gd2.NIter = NIter;
-	gd2.xstride = Nx + 2*DIMT;
-	gd2.ystride = Ny + 2*DIMT;
+	gd2.xstride = Nx + 2;
+	gd2.ystride = Ny + 2;
 	gd2.zstride = Nz + 2;
 	gd2.data = (PFT)_mm_malloc(gd2.xstride * gd2.ystride * gd2.zstride * sizeof(FT), 64);
 
@@ -364,37 +1186,51 @@ void compute_stencil_3_5D(IT Nx, IT Ny, IT Nz, int NIter)
 		rit = 0;
 	}
 	int dimt, i;
+	double tc1 = dsecnd();
 
 	for(i = 0; i < itb; ++i)
 	{
 		dimt = (i != itb - 1 || !rit) ? DIMT : rit;
 		if(i % 2 == 0)
+		{
 			compute_stencil_iter(&gd, dimt, &gd2);
+	//		printf("sumgrid : %.5f \n", sum_grid(&gd2));
+		}
 		else
+		{
 			compute_stencil_iter(&gd2, dimt, &gd);
+	//		printf("sumgrid : %.5f \n", sum_grid(&gd));
+		}
 
 	}
+	double tc2 = dsecnd();
+	printf("time : %.5f seconds\n", tc2-tc1);
 
 
-#ifdef PRINT_DEBUG
+#ifdef PRINT_FINISH_DEBUG
 	grid_data* pgd = &gd2;
 	if(i % 2 == 0)
 	{
 		pgd = &gd;
 	}
-	for(int z = 0; z < Nz; ++z)
+	//for(int j = 0; j < 10 && j < Nz; ++j)
+		//printf("checkSum layer %d and %d : %.5f, %.5f\n", j, Nz+1-j, checkSum(pgd->data, pgd->xstride, pgd->ystride, pgd->zstride, j), checkSum(pgd->data, pgd->xstride, pgd->ystride, pgd->zstride, Nz+1-j));
+	for(int j = 0; j < Nz+2; j++)
+		printf("j %d, %.5f\n", j, checkSum(pgd->data, pgd->xstride, pgd->ystride, pgd->zstride, j));
+
+	/*for(int z = 0; z < Nz; ++z)
 	{
 		printf("z : %d\n", z);
 		for(int y = 0; y < Ny; ++y)
 		{
 			for(int x = 0; x < Nx; ++x)
 			{
-				printf("%.1f ", E(pgd, x+DIMT, y+DIMT,z+1));
+				printf("%.1f ", E(pgd, x+1, y+1,z+1));
 			}
 			printf("\n");
 		}
 		printf("\n");
-	}
+	}*/
 #endif
 
 
@@ -405,7 +1241,25 @@ void compute_stencil_3_5D(IT Nx, IT Ny, IT Nz, int NIter)
 int main(int argc, char** argv)
 {
 
-	compute_stencil_3_5D(10, 10, 10, 3);
+	int Nx = 512, Ny = 512, Nz = 512, n = 100;
+	bufferB1_1 = (PFT)_mm_malloc((Nx+2)*(BOUNDARY_OFFSET+DIMT)*3*8, 64);
+	bufferB1_2 = (PFT)_mm_malloc((Nx+2)*(BOUNDARY_OFFSET+DIMT-1)*3*8, 64);
+	bufferB2_1 = (PFT)_mm_malloc((Nx+2)*(BOUNDARY_OFFSET+DIMT)*3*8, 64);
+	bufferB2_2 = (PFT)_mm_malloc((Nx+2)*(BOUNDARY_OFFSET+DIMT-1)*3*8, 64);
+	bufferB3_1 = (PFT)_mm_malloc((BOUNDARY_OFFSET+DIMT)*(Ny+2)*3*8, 64);
+	bufferB3_2 = (PFT)_mm_malloc((BOUNDARY_OFFSET+DIMT-1)*(Ny+2)*3*8, 64);
+	bufferB4_1 = (PFT)_mm_malloc((BOUNDARY_OFFSET+DIMT)*(Ny+2)*3*8, 64);
+	bufferB4_2 = (PFT)_mm_malloc((BOUNDARY_OFFSET+DIMT-1)*(Ny+2)*3*8, 64);
+	memset(bufferB1_1, 0, (Nx+2)*(BOUNDARY_OFFSET+DIMT)*3*8);
+	memset(bufferB1_2, 0, (Nx+2)*(BOUNDARY_OFFSET+DIMT-1)*3*8);
+	memset(bufferB2_1, 0, (Nx+2)*(BOUNDARY_OFFSET+DIMT)*3*8);
+	memset(bufferB2_2, 0, (Nx+2)*(BOUNDARY_OFFSET+DIMT-1)*3*8);
+	memset(bufferB3_1, 0, (BOUNDARY_OFFSET+DIMT)*(Ny+2)*3*8);
+	memset(bufferB3_2, 0, (BOUNDARY_OFFSET+DIMT-1)*(Ny+2)*3*8);
+	memset(bufferB4_1, 0, (BOUNDARY_OFFSET+DIMT)*(Ny+2)*3*8);
+	memset(bufferB4_2, 0, (BOUNDARY_OFFSET+DIMT-1)*(Ny+2)*3*8);
+
+	compute_stencil_3_5D(Nx, Ny, Nz, n);
 
 	return 0;
 }

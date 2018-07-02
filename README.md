@@ -1,2 +1,2 @@
 # stencil
-Implemented with OpenMP, MPI, MIC。
+Implemented with OpenMP, GPU cuda, MPI。
